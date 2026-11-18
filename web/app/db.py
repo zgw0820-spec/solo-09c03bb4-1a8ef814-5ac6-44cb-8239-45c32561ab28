@@ -37,6 +37,18 @@ CREATE TABLE IF NOT EXISTS ops (
   created_at       TEXT NOT NULL,
   updated_at       TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS renewals (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  domain          TEXT NOT NULL,
+  key_type        TEXT NOT NULL,        -- rsa|ec
+  csr_pem         TEXT NOT NULL,        -- 可交付 CA 的 CSR
+  key_pem         TEXT NOT NULL,        -- 申请私钥，仅服务端保存
+  state           TEXT NOT NULL,        -- pending|submitted|revoked
+  version_id      INTEGER,              -- 回签后登记的候选版本
+  detail          TEXT,
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL
+);
 """
 
 

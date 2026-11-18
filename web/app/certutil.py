@@ -68,6 +68,27 @@ def parse_private_key(data: bytes):
     return key
 
 
+def parse_csr(data: bytes):
+    try:
+        csr = x509.load_pem_x509_csr(data)
+    except ValueError as exc:
+        raise CertError(f"CSR PEM 解析失败: {exc}") from exc
+    try:
+        valid = csr.is_signature_valid
+    except Exception as exc:  # 某些算法/版本可能不支持自验签
+        raise CertError(f"CSR 签名无法校验: {exc}") from exc
+    if not valid:
+        raise CertError("CSR 签名无效")
+    return csr
+
+
+def public_key_der(key) -> bytes:
+    """私钥/公钥对象 -> SubjectPublicKeyInfo DER（用于比对申请与签发证书）。"""
+    if hasattr(key, "public_key"):
+        key = key.public_key()
+    return _pub_der(key)
+
+
 def _pub_der(pub) -> bytes:
     return pub.public_bytes(
         serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
@@ -183,6 +204,56 @@ def validate_upload(
     )
 
 
+# ---------------------------------------------------------------- 续期申请（CSR）
+
+
+def generate_csr(
+    domain: str, key_type: str = "rsa", key_size: int = 2048
+) -> tuple[bytes, bytes]:
+    """为续期申请生成独立私钥与 CSR，返回 (私钥 PEM, CSR PEM)。
+
+    私钥只在服务端保存/使用，CSR 可安全交给 CA。
+    """
+    if key_type == "rsa":
+        key = rsa.generate_private_key(public_exponent=65537, key_size=key_size)
+    elif key_type == "ec":
+        key = ec.generate_private_key(ec.SECP256R1())
+    else:
+        raise CertError(f"不支持的密钥类型: {key_type}")
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, domain)])
+    csr = (
+        x509.CertificateSigningRequestBuilder()
+        .subject_name(name)
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(domain)]), False)
+        .sign(key, hashes.SHA256())
+    )
+    return _key_pem(key), csr.public_bytes(serialization.Encoding.PEM)
+
+
+def validate_csr_signback(
+    chain_pem: bytes,
+    request_key_pem: bytes,
+    csr_pem: bytes,
+    domain: str,
+    now: dt.datetime | None = None,
+) -> CertInfo:
+    """校验 CA 对续期 CSR 的回签，返回叶子证书信息。失败抛 CertError。
+
+    比普通上传多一条硬性校验：叶子证书公钥必须与申请 CSR 公钥一致，
+    确保登记到该申请名下的是"这个申请"被签发的证书。
+    """
+    certs = parse_pem_chain(chain_pem)
+    csr = parse_csr(csr_pem)
+    key = parse_private_key(request_key_pem)
+    csr_pub = _pub_der(csr.public_key())
+    if _pub_der(key.public_key()) != csr_pub:
+        raise CertError("申请私钥与 CSR 公钥不匹配")
+    if _pub_der(certs[0].public_key()) != csr_pub:
+        raise CertError("回签证书公钥与申请 CSR 公钥不匹配")
+    # 公钥、域名、有效期、签发链均沿用普通上传的校验规则
+    return validate_upload(chain_pem, request_key_pem, domain, now=now)
+
+
 # ---------------------------------------------------------------- 演示证书生成
 
 
@@ -247,6 +318,45 @@ def generate_server_cert(
 
 def _cert_pem(cert: x509.Certificate) -> bytes:
     return cert.public_bytes(serialization.Encoding.PEM)
+
+
+def sign_csr(
+    csr_pem: bytes,
+    ca_cert_pem: bytes,
+    ca_key_pem: bytes,
+    days_valid: int = 365,
+    not_before_days_ago: int = 0,
+) -> bytes:
+    """演示 CA 对 CSR 回签，返回链 PEM（服务器证书 + CA）。"""
+    csr = parse_csr(csr_pem)
+    ca_cert = x509.load_pem_x509_certificate(ca_cert_pem)
+    ca_key = serialization.load_pem_private_key(ca_key_pem, password=None)
+    now = dt.datetime.now(dt.timezone.utc)
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(csr.subject)
+        .issuer_name(ca_cert.subject)
+        .public_key(csr.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - dt.timedelta(days=not_before_days_ago))
+        .not_valid_after(now + dt.timedelta(days=days_valid))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
+    )
+    csr_san = None
+    try:
+        csr_san = csr.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    except x509.ExtensionNotFound:
+        csr_san = None
+    if csr_san is not None:
+        builder = builder.add_extension(csr_san, False)
+    else:
+        cn = csr.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+        if cn:
+            builder = builder.add_extension(
+                x509.SubjectAlternativeName([x509.DNSName(cn[0].value)]), False
+            )
+    cert = builder.sign(ca_key, hashes.SHA256())
+    return _cert_pem(cert) + ca_cert_pem
 
 
 def _key_pem(key) -> bytes:

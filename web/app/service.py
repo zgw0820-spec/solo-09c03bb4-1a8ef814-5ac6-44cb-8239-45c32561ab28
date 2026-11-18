@@ -66,6 +66,7 @@ class Config:
     startup_probe_timeout: float = 15.0
     restore_interval: float = 30.0    # 无在途操作时一致性修复的最小间隔
     activate_delay_after_write: float = 0.0  # 测试钩子：写完文件后人为延迟
+    signback_delay_after_validate: float = 0.0  # 测试钩子：校验后、落库前延迟
 
     @property
     def db_path(self) -> str:
@@ -86,6 +87,9 @@ class Config:
             pending_ttl=float(e.get("PENDING_TTL", "45")),
             startup_probe_timeout=float(e.get("STARTUP_PROBE_TIMEOUT", "15")),
             activate_delay_after_write=float(e.get("ACTIVATE_DELAY_AFTER_WRITE", "0")),
+            signback_delay_after_validate=float(
+                e.get("SIGNBACK_DELAY_AFTER_VALIDATE", "0")
+            ),
         )
 
 
@@ -555,6 +559,12 @@ class CertService:
                     "SELECT * FROM ops ORDER BY seq DESC LIMIT 10"
                 ).fetchall()
             ]
+            renewals = [
+                self._renewal_public(r)
+                for r in c.execute(
+                    "SELECT * FROM renewals ORDER BY id DESC LIMIT 50"
+                ).fetchall()
+            ]
         active = next(
             (v for v in versions if v["id"] == st["active_version_id"]), None
         )
@@ -574,6 +584,7 @@ class CertService:
             "active": active,
             "versions": versions,
             "ops": ops,
+            "renewals": renewals,
             "latest_op": ops[0] if ops else None,
         }
 
@@ -594,6 +605,160 @@ class CertService:
                 return certutil.fingerprint_pem_chain(f.read())
         except (OSError, certutil.CertError):
             return None
+
+    # ------------------------------------------------------------ 续期申请
+
+    @staticmethod
+    def _renewal_public(row) -> dict:
+        """对外展示时去掉申请私钥，私钥只在服务端回签登记时使用。"""
+        d = dict(row)
+        d.pop("key_pem", None)
+        return d
+
+    def create_renewal(self, key_type: str = "rsa") -> dict:
+        """每次申请生成独立私钥与 CSR；私钥随申请记录持久化，重启后可找回。"""
+        if key_type not in ("rsa", "ec"):
+            raise BadRequest("密钥类型仅支持 rsa 或 ec")
+        key_pem, csr_pem = certutil.generate_csr(self.cfg.site_domain, key_type)
+        ts = now_iso()
+        with self.db.txn() as c:
+            cur = c.execute(
+                "INSERT INTO renewals (domain, key_type, csr_pem, key_pem, state,"
+                " version_id, detail, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    self.cfg.site_domain, key_type, csr_pem.decode(),
+                    key_pem.decode(), "pending", None, None, ts, ts,
+                ),
+            )
+            row = c.execute(
+                "SELECT * FROM renewals WHERE id=?", (cur.lastrowid,)
+            ).fetchone()
+        log.info("renewal #%s created key_type=%s", row["id"], key_type)
+        return self._renewal_public(row)
+
+    def get_renewal(self, renewal_id: int, include_key: bool = False) -> dict:
+        with self.db.txn() as c:
+            row = c.execute(
+                "SELECT * FROM renewals WHERE id=?", (renewal_id,)
+            ).fetchone()
+        if not row:
+            raise NotFound(f"续期申请 #{renewal_id} 不存在")
+        return dict(row) if include_key else self._renewal_public(row)
+
+    def revoke_renewal(self, renewal_id: int) -> dict:
+        """撤销待签申请。只有仍处于 pending 的申请可撤销，重复撤销幂等。"""
+        with self.db.txn() as c:
+            row = c.execute(
+                "SELECT * FROM renewals WHERE id=?", (renewal_id,)
+            ).fetchone()
+            if not row:
+                raise NotFound(f"续期申请 #{renewal_id} 不存在")
+            if row["state"] == "revoked":
+                return self._renewal_public(row)
+            if row["state"] == "submitted":
+                raise Conflict(f"续期申请 #{renewal_id} 已回签登记，不能撤销")
+            c.execute(
+                "UPDATE renewals SET state='revoked', detail=?, updated_at=?"
+                " WHERE id=? AND state='pending'",
+                ("值班员撤销", now_iso(), renewal_id),
+            )
+            row = c.execute(
+                "SELECT * FROM renewals WHERE id=?", (renewal_id,)
+            ).fetchone()
+        log.info("renewal #%s revoked", renewal_id)
+        return self._renewal_public(row)
+
+    def signback(self, renewal_id: int, chain_pem: bytes):
+        """登记 CA 回签结果，返回 (版本记录, 是否新登记)。
+
+        校验全部通过后，才在数据库事务内用该申请的私钥登记候选版本。
+        与撤销并发时由 BEGIN IMMEDIATE 串行化：撤销先提交则本请求拒绝；
+        重复回签同一证书返回已登记版本，不会重复登记。
+        """
+        with self.db.txn() as c:
+            row = c.execute(
+                "SELECT * FROM renewals WHERE id=?", (renewal_id,)
+            ).fetchone()
+        if not row:
+            raise NotFound(f"续期申请 #{renewal_id} 不存在")
+        if row["state"] == "revoked":
+            raise Conflict(f"续期申请 #{renewal_id} 已撤销，不能再登记候选")
+        # 校验：公钥与申请一致、域名、有效期、签发链（在事务外做，避免持锁做密码学运算）
+        try:
+            info = certutil.validate_csr_signback(
+                chain_pem,
+                row["key_pem"].encode(),
+                row["csr_pem"].encode(),
+                self.cfg.site_domain,
+            )
+        except certutil.CertError:
+            log.info("renewal #%s signback validation failed", renewal_id)
+            raise
+        if self.cfg.signback_delay_after_validate:  # 测试钩子：放大竞态窗口
+            time.sleep(self.cfg.signback_delay_after_validate)
+        # 事务内重新读取状态并登记，撤销与回签只能有一个先生效
+        with self.db.txn() as c:
+            row = c.execute(
+                "SELECT * FROM renewals WHERE id=?", (renewal_id,)
+            ).fetchone()
+            if not row:
+                raise NotFound(f"续期申请 #{renewal_id} 不存在")
+            if row["state"] == "revoked":
+                raise Conflict(f"续期申请 #{renewal_id} 已撤销，不能再登记候选")
+            if row["state"] == "submitted":
+                existing = None
+                if row["version_id"] is not None:
+                    existing = c.execute(
+                        "SELECT * FROM versions WHERE id=?", (row["version_id"],)
+                    ).fetchone()
+                if (existing and existing["fingerprint"] == info.fingerprint
+                        and existing["cert_pem"].strip() == chain_pem.decode().strip()):
+                    return dict(existing), False
+                raise Conflict(
+                    f"续期申请 #{renewal_id} 已回签登记，不能重复登记"
+                )
+            existing = c.execute(
+                "SELECT * FROM versions WHERE fingerprint=?", (info.fingerprint,)
+            ).fetchone()
+            if existing:
+                # 同一张证书可能已经上传过：确认其私钥就是本申请的私钥，
+                # 才能安全地关联到本申请。否则拒绝，避免把私钥张冠李戴。
+                same_key = (
+                    certutil.public_key_der(certutil.parse_private_key(
+                        row["key_pem"].encode()))
+                    == certutil.public_key_der(certutil.parse_private_key(
+                        existing["key_pem"].encode()))
+                )
+                if not same_key:
+                    raise Conflict("相同证书已存在且私钥不同，不能用本申请私钥登记")
+                vid = existing["id"]
+                created = False
+            else:
+                cur = c.execute(
+                    "INSERT INTO versions (fingerprint, domain, subject, san,"
+                    " not_before, not_after, cert_pem, key_pem, status, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        info.fingerprint, self.cfg.site_domain, info.subject,
+                        ",".join(info.san), info.not_before.isoformat(),
+                        info.not_after.isoformat(), chain_pem.decode(),
+                        row["key_pem"], "candidate", now_iso(),
+                    ),
+                )
+                vid = cur.lastrowid
+                created = True
+            c.execute(
+                "UPDATE renewals SET state='submitted', version_id=?, detail=?,"
+                " updated_at=? WHERE id=?",
+                (vid, f"已登记为候选版本 #{vid}", now_iso(), renewal_id),
+            )
+            version = c.execute(
+                "SELECT * FROM versions WHERE id=?", (vid,)
+            ).fetchone()
+        log.info("renewal #%s signed back -> version #%s (created=%s)",
+                 renewal_id, vid, created)
+        return dict(version), created
 
     # ------------------------------------------------------------ 内部
 

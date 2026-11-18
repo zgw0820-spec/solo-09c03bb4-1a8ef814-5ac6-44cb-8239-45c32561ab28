@@ -82,6 +82,63 @@
 </table>
 <p class="muted">启用按钮携带本页渲染时的在用版号；若页面已过期，提交将被拒绝且不影响在用证书。</p>
 
+<h2>续期申请（CSR 由服务端生成，私钥不出服务端）</h2>
+<div class="card">
+  <form method="post" action="/renewal">
+    <p>密钥类型：
+      <select name="key_type">
+        <option value="rsa" selected>RSA 2048</option>
+        <option value="ec">ECDSA P-256</option>
+      </select>
+      <input type="hidden" name="redirect" value="1">
+      <button type="submit">生成新申请</button>
+    </p>
+  </form>
+  <p class="muted">每次申请生成独立私钥与 CSR；申请记录和私钥保存在服务端数据目录，重启后可找回。
+     CSR 可交给内部 CA 回签，私钥始终留在服务端。</p>
+</div>
+
+{% if st.renewals %}
+<table>
+  <tr><th>申请</th><th>密钥</th><th>状态</th><th>创建时间</th><th>操作</th></tr>
+  {% for r in st.renewals %}
+  <tr>
+    <td>#{{ r.id }}</td>
+    <td>{{ r.key_type|upper }}</td>
+    <td>
+      {% if r.state == 'pending' %}待回签
+      {% elif r.state == 'submitted' %}已回签 → 候选版本
+        {% if r.version_id %}#{{ r.version_id }}{% endif %}
+      {% else %}已撤销{% endif %}
+      {% if r.detail %}<br><span class="muted">{{ r.detail }}</span>{% endif %}
+    </td>
+    <td>{{ r.created_at }}</td>
+    <td>
+      <a href="/api/renewal/{{ r.id }}/csr">下载 CSR</a>
+      {% if r.state == 'pending' %}
+      <form method="post" action="/renewal/{{ r.id }}/signback"
+            enctype="multipart/form-data" style="display:inline-block; margin-left:.6rem">
+        <input type="file" name="cert_file" required
+               aria-label="CA 回签的 PEM 链">
+        <input type="hidden" name="redirect" value="1">
+        <button type="submit">上传回签 PEM</button>
+      </form>
+      <form method="post" action="/renewal/{{ r.id }}/revoke" style="display:inline">
+        <input type="hidden" name="redirect" value="1">
+        <button type="submit">撤销</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+<p class="muted">回签上传时校验：证书公钥与申请 CSR 一致、域名覆盖 {{ st.domain }}、
+  有效期、签发链逐级有效。全部通过才用该申请私钥登记候选版本；
+  撤销与回签并发时，先撤销成功者生效，该申请不能再生成候选。</p>
+{% else %}
+<p class="muted">暂无续期申请。</p>
+{% endif %}
+
 <h2>上传新证书</h2>
 <div class="card">
   <form method="post" action="/upload" enctype="multipart/form-data">
@@ -94,5 +151,21 @@
 </div>
 
 <p class="muted">页面每 5 秒自动刷新。已有 TLS 连接不受重载影响，可自然完成。</p>
+<script>
+// 自动刷新会清空文件选择框：已选文件时暂停刷新，提交后再恢复。
+(function () {
+  var filesChosen = false;
+  document.querySelectorAll('input[type=file]').forEach(function (el) {
+    el.addEventListener('change', function () {
+      filesChosen = Array.prototype.some.call(
+        document.querySelectorAll('input[type=file]'), function (i) {
+          return i.files && i.files.length > 0;
+        });
+      var meta = document.querySelector('meta[http-equiv=refresh]');
+      if (meta) meta.content = filesChosen ? '3600' : '5';
+    });
+  });
+})();
+</script>
 </body>
 </html>

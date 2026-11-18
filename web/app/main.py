@@ -5,9 +5,10 @@ import logging
 from contextlib import asynccontextmanager
 from urllib.parse import quote
 
-from fastapi import FastAPI, Form, Request, UploadFile
+from fastapi import FastAPI, Form, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from starlette.concurrency import run_in_threadpool
 
 from . import certutil
 from .service import BadRequest, CertService, Conflict, Config, NotFound
@@ -66,6 +67,89 @@ def api_op(seq: int):
         return JSONResponse({"error": str(exc)}, status_code=404)
 
 
+@app.get("/api/renewal/{renewal_id}")
+def api_renewal(renewal_id: int):
+    try:
+        return service.get_renewal(renewal_id)
+    except NotFound as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+
+
+@app.get("/api/renewal/{renewal_id}/csr")
+def api_renewal_csr(renewal_id: int):
+    try:
+        r = service.get_renewal(renewal_id)
+    except NotFound as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    return Response(
+        content=r["csr_pem"].encode(),
+        media_type="application/pkcs10",
+        headers={
+            "Content-Disposition": f'attachment; filename="renewal-{renewal_id}.csr"'
+        },
+    )
+
+
+@app.post("/renewal")
+def create_renewal(request: Request, key_type: str = Form("rsa"),
+                   redirect: int = Form(0)):
+    try:
+        r = service.create_renewal(key_type)
+    except BadRequest as exc:
+        return _respond(request, redirect, {"err": str(exc)}, 400)
+    msg = (f"已生成续期申请 #{r['id']}（独立私钥留存在服务端）。"
+           f"请下载 CSR 交给 CA，回签后在此上传 PEM 链。")
+    return _respond(
+        request, redirect,
+        {"msg": msg, "renewal_id": r["id"], "renewal": r},
+    )
+
+
+@app.post("/renewal/{renewal_id}/revoke")
+def revoke_renewal(request: Request, renewal_id: int, redirect: int = Form(0)):
+    try:
+        r = service.revoke_renewal(renewal_id)
+    except NotFound as exc:
+        return _respond(request, redirect, {"err": str(exc)}, 404)
+    except Conflict as exc:
+        return _respond(request, redirect, {"err": str(exc)}, 409)
+    return _respond(
+        request, redirect,
+        {"msg": f"续期申请 #{renewal_id} 已撤销，该申请不能再登记候选。",
+         "renewal": r},
+    )
+
+
+@app.post("/renewal/{renewal_id}/signback")
+async def signback(
+    request: Request,
+    renewal_id: int,
+    cert_file: UploadFile,
+    redirect: int = Form(0),
+):
+    chain = await cert_file.read()
+    try:
+        # 校验与事务均为阻塞操作，放入线程池，避免阻塞事件循环
+        # （否则并发撤销/回签请求会被串行化到回签完成后才处理）
+        version, created = await run_in_threadpool(
+            service.signback, renewal_id, chain
+        )
+    except certutil.CertError as exc:
+        return _respond(request, redirect, {"err": f"回签校验失败：{exc}"}, 400)
+    except NotFound as exc:
+        return _respond(request, redirect, {"err": str(exc)}, 404)
+    except Conflict as exc:
+        return _respond(request, redirect, {"err": str(exc)}, 409)
+    if created:
+        msg = f"回签校验通过，已用申请私钥登记为候选版本 #{version['id']}"
+    else:
+        msg = f"该回签证书已登记（版本 #{version['id']}），未重复登记"
+    return _respond(
+        request, redirect,
+        {"msg": msg, "version_id": version["id"], "created": created},
+    )
+
+
 @app.post("/upload")
 async def upload(
     request: Request,
@@ -76,7 +160,7 @@ async def upload(
     chain = await cert_file.read()
     key = await key_file.read()
     try:
-        version, created = service.upload(chain, key)
+        version, created = await run_in_threadpool(service.upload, chain, key)
     except certutil.CertError as exc:
         return _respond(request, redirect, {"err": f"证书校验失败：{exc}"}, 400)
     if created:

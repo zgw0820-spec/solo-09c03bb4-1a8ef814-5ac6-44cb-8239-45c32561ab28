@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime as dt
 import threading
+import time
 
 import pytest
 from cryptography import x509
@@ -304,6 +305,255 @@ def test_old_pending_op_cannot_overwrite_newer(service):
     st = service.status(probe=False)
     assert st["active_version_id"] == v3["id"]
     assert service.live_fingerprint() == v3["fingerprint"]
+
+
+# ---------------------------------------------------------------- 续期申请
+
+
+def signback_cert(service, csr_pem, **kw):
+    """用演示 CA 对 CSR 回签，模拟 CA 处理。"""
+    with open(f"{service.cfg.data_dir}/ca/ca.pem", "rb") as f:
+        ca_cert = f.read()
+    with open(f"{service.cfg.data_dir}/ca/ca-key.pem", "rb") as f:
+        ca_key = f.read()
+    return certutil.sign_csr(csr_pem, ca_cert, ca_key, **kw)
+
+
+def test_renewal_creates_distinct_key_and_csr(service):
+    r1 = service.create_renewal("rsa")
+    r2 = service.create_renewal("rsa")
+    assert r1["id"] != r2["id"]
+    assert "key_pem" not in r1  # 接口不返回私钥
+    k1 = service.get_renewal(r1["id"], include_key=True)["key_pem"]
+    k2 = service.get_renewal(r2["id"], include_key=True)["key_pem"]
+    assert k1 != k2  # 每次独立密钥
+    csr1 = certutil.parse_csr(r1["csr_pem"].encode())
+    assert certutil.public_key_der(csr1.public_key()) == certutil.public_key_der(
+        certutil.parse_private_key(k1.encode())
+    )
+    assert certutil.dns_name_matches(
+        csr1.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        .value.get_values_for_type(x509.DNSName)[0], DOMAIN
+    )
+
+
+def test_renewal_private_key_survives_restart(cfg):
+    svc = CertService(cfg)
+    svc.control = FakeControl(svc)
+    svc.startup(background=False)
+    r = svc.create_renewal()
+    key_before = svc.get_renewal(r["id"], include_key=True)["key_pem"]
+    csr_before = svc.get_renewal(r["id"])["csr_pem"]
+    svc.shutdown()
+
+    svc2 = CertService(cfg)
+    svc2.control = FakeControl(svc2)
+    svc2.startup(background=False)
+    got = svc2.get_renewal(r["id"], include_key=True)
+    assert got["key_pem"] == key_before
+    assert got["csr_pem"] == csr_before
+    assert got["state"] == "pending"
+    # 重启后可继续对该申请回签登记
+    chain = signback_cert(svc2, csr_before.encode())
+    version, created = svc2.signback(r["id"], chain)
+    assert created and version["status"] == "candidate"
+    assert version["key_pem"] == key_before
+    svc2.shutdown()
+
+
+def test_signback_happy_path_registers_candidate(service):
+    r = service.create_renewal()
+    chain = signback_cert(service, r["csr_pem"].encode())
+    version, created = service.signback(r["id"], chain)
+    assert created
+    assert version["status"] == "candidate"
+    assert version["key_pem"] == service.get_renewal(
+        r["id"], include_key=True)["key_pem"]
+    assert service.get_renewal(r["id"])["state"] == "submitted"
+    # 沿用原启用流程：候选可启用
+    op = service.activate(version["id"], base_version_id=1)
+    assert op["state"] == "succeeded"
+    assert service.status(probe=False)["active_version_id"] == version["id"]
+
+
+def test_signback_duplicate_not_reregistered(service):
+    r = service.create_renewal()
+    chain = signback_cert(service, r["csr_pem"].encode())
+    v1, created1 = service.signback(r["id"], chain)
+    v2, created2 = service.signback(r["id"], chain)
+    assert created1 and not created2
+    assert v1["id"] == v2["id"]
+    st = service.status(probe=False)
+    assert len([v for v in st["versions"] if v["fingerprint"] == v1["fingerprint"]]) == 1
+
+
+def test_signback_wrong_public_key_rejected(service):
+    r = service.create_renewal()
+    other = service.create_renewal()
+    # 用另一个申请的 CSR 回签，证书公钥与本申请不符
+    chain = signback_cert(service, other["csr_pem"].encode())
+    with pytest.raises(CertError, match="公钥"):
+        service.signback(r["id"], chain)
+    assert service.get_renewal(r["id"])["state"] == "pending"
+    assert len(service.status(probe=False)["versions"]) == 1
+
+
+def test_signback_wrong_domain_rejected(service):
+    r = service.create_renewal()
+    key = certutil.parse_private_key(
+        service.get_renewal(r["id"], include_key=True)["key_pem"].encode())
+    # 同一申请公钥，但 CA 签成了其它域名（模拟签错/串单）
+    chain = _sign_with_demo_ca(service, key, "other.internal")
+    with pytest.raises(CertError, match="域名"):
+        service.signback(r["id"], chain)
+    assert service.get_renewal(r["id"])["state"] == "pending"
+
+
+def _sign_with_demo_ca(service, key, domain):
+    """用演示 CA 以给定公钥签发指定域名证书，返回链 PEM。"""
+    with open(f"{service.cfg.data_dir}/ca/ca.pem", "rb") as f:
+        ca_cert = x509.load_pem_x509_certificate(f.read())
+    with open(f"{service.cfg.data_dir}/ca/ca-key.pem", "rb") as f:
+        ca_key = serialization.load_pem_private_key(f.read(), password=None)
+    now = dt.datetime.now(dt.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, domain)]))
+        .issuer_name(ca_cert.subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - dt.timedelta(minutes=5))
+        .not_valid_after(now + dt.timedelta(days=365))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(domain)]), False)
+        .sign(ca_key, hashes.SHA256())
+    )
+    return (
+        cert.public_bytes(serialization.Encoding.PEM)
+        + ca_cert.public_bytes(serialization.Encoding.PEM)
+    )
+
+
+def test_signback_broken_chain_rejected(service):
+    r = service.create_renewal()
+    chain = signback_cert(service, r["csr_pem"].encode())
+    leaf = chain.split(b"-----END CERTIFICATE-----")[0] + b"-----END CERTIFICATE-----\n"
+    other_ca, _ = certutil.generate_ca("Other CA")
+    with pytest.raises(CertError, match="证书链"):
+        service.signback(r["id"], leaf + other_ca)
+    assert service.get_renewal(r["id"])["state"] == "pending"
+
+
+def test_signback_expired_rejected(service):
+    r = service.create_renewal()
+    chain = signback_cert(service, r["csr_pem"].encode(),
+                          days_valid=-1, not_before_days_ago=10)
+    with pytest.raises(CertError, match="已过期"):
+        service.signback(r["id"], chain)
+
+
+def test_revoke_pending_then_signback_rejected(service):
+    r = service.create_renewal()
+    out = service.revoke_renewal(r["id"])
+    assert out["state"] == "revoked"
+    assert service.revoke_renewal(r["id"])["state"] == "revoked"  # 幂等
+    chain = signback_cert(service, r["csr_pem"].encode())
+    with pytest.raises(Conflict, match="撤销"):
+        service.signback(r["id"], chain)
+    assert len(service.status(probe=False)["versions"]) == 1
+
+
+def test_revoke_after_signback_rejected(service):
+    r = service.create_renewal()
+    service.signback(r["id"], signback_cert(service, r["csr_pem"].encode()))
+    with pytest.raises(Conflict, match="不能撤销"):
+        service.revoke_renewal(r["id"])
+
+
+def test_revoke_signback_race_single_winner(service):
+    """撤销与回签并发：无论交错如何，撤销成功后绝不能生成候选。"""
+    for _ in range(5):
+        r = service.create_renewal()
+        chain = signback_cert(service, r["csr_pem"].encode())
+        versions_before = len(service.status(probe=False)["versions"])
+        barrier = threading.Barrier(2)
+        result = {}
+
+        def do_signback():
+            barrier.wait()
+            try:
+                result["signback"] = ("ok", service.signback(r["id"], chain)[0]["id"])
+            except Conflict as exc:
+                result["signback"] = ("conflict", str(exc))
+
+        def do_revoke():
+            barrier.wait()
+            try:
+                result["revoke"] = ("ok", service.revoke_renewal(r["id"]))
+            except Conflict as exc:
+                result["revoke"] = ("conflict", str(exc))
+
+        threads = [threading.Thread(target=do_signback), threading.Thread(target=do_revoke)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        final = service.get_renewal(r["id"])
+        assert "signback" in result and "revoke" in result
+        if final["state"] == "revoked":
+            # 撤销先落库：回签必须失败，且没有新版本
+            assert result["signback"][0] == "conflict"
+            assert len(service.status(probe=False)["versions"]) == versions_before
+        else:
+            # 回签先落库：撤销必须被拒，且只登记一个候选
+            assert final["state"] == "submitted"
+            assert result["revoke"][0] == "conflict"
+            assert len(service.status(probe=False)["versions"]) == versions_before + 1
+
+
+def test_signback_after_revoke_race_with_delay(cfg):
+    """回签先完成校验、随后撤销先落库：回签必须失败，不能生成候选。"""
+    cfg.signback_delay_after_validate = 0.5
+    svc = CertService(cfg)
+    svc.control = FakeControl(svc)
+    svc.startup(background=False)
+    r = svc.create_renewal()
+    chain = signback_cert(svc, r["csr_pem"].encode())
+    versions_before = len(svc.status(probe=False)["versions"])
+    out = {}
+
+    def do_sign():
+        try:
+            out["sign"] = ("ok", svc.signback(r["id"], chain)[0]["id"])
+        except Conflict as exc:
+            out["sign"] = ("conflict", str(exc))
+
+    t = threading.Thread(target=do_sign)
+    t.start()
+    time.sleep(0.15)  # 让回签进入"已校验、未落库"窗口
+    svc.revoke_renewal(r["id"])
+    t.join()
+
+    assert out["sign"][0] == "conflict", out
+    assert svc.get_renewal(r["id"])["state"] == "revoked"
+    assert len(svc.status(probe=False)["versions"]) == versions_before
+    svc.shutdown()
+
+
+def test_signback_failure_does_not_touch_active(service):
+    r = service.create_renewal()
+    old = service.status(probe=False)["active"]
+    with pytest.raises(CertError):
+        service.signback(r["id"], _sign_with_demo_ca(
+            service,
+            certutil.parse_private_key(
+                service.get_renewal(r["id"], include_key=True)["key_pem"].encode()),
+            "evil.internal",
+        ))
+    st = service.status(probe=False)
+    assert st["active_version_id"] == 1
+    assert st["active"]["fingerprint"] == old["fingerprint"]
+    assert service.live_fingerprint() == old["fingerprint"]
 
 
 # ---------------------------------------------------------------- 重启恢复
